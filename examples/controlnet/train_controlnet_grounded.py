@@ -39,11 +39,13 @@ import albumentations as A
 from albumentations.pytorch.transforms import ToTensorV2
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+import warnings
 
 import diffusers
 from diffusers import (
     AutoencoderKL,
     ControlNetModel,
+    ControlNetGroundedModel,
     DDPMScheduler,
     StableDiffusionControlNetPipeline,
     UNet2DConditionModel,
@@ -650,7 +652,7 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    def tokenize_captions(examples, is_train=True):
+    def tokenize_captions(examples, is_train=True,):
         captions = []
         for caption in examples[caption_column]:
             if random.random() < args.proportion_empty_prompts:
@@ -668,6 +670,7 @@ def make_train_dataset(args, tokenizer, accelerator):
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
+
 
     image_transforms = A.Compose(
         [
@@ -689,8 +692,25 @@ def make_train_dataset(args, tokenizer, accelerator):
     )
 
     def preprocess_train(examples):
+        max_objs = 30
+        gligen_boxes = [gnd["bbox"][0] for gnd in examples["grounding"]]
+        gligen_phrases = [gnd["noun"][0] for gnd in examples["grounding"]]
+        
+        for i, gligen_img_bboxs in enumerate(gligen_boxes):
+            if len(gligen_img_bboxs) > max_objs:
+                warnings.warn(
+                    f"More that {max_objs} objects found. Only first {max_objs} objects will be processed.",
+                    FutureWarning,
+                )
+                gligen_phrases[i] = gligen_phrases[i][:max_objs]
+                gligen_boxes[i] = gligen_boxes[i][:max_objs]
+
         images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
+        transformed = [image_transforms(image=image, bboxes=gligen_img_bs, class_labels=gligen_img_ps) for image, gligen_img_bs, gligen_img_ps in zip(images, gligen_boxes, gligen_phrases)]
+        
+        images = [img for img in transformed["image"]]
+        gligen_bboxes_new = transformed['bboxes']
+        gligen_phrases_new = transformed['class_labels']
 
         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
@@ -698,6 +718,10 @@ def make_train_dataset(args, tokenizer, accelerator):
         examples["pixel_values"] = images
         examples["conditioning_pixel_values"] = conditioning_images
         examples["input_ids"] = tokenize_captions(examples)
+
+        gligen_phrases_input_ids = [tokenizer(gligen_img_phrases_new,
+                                              padding=True,
+                                              return_tensors="pt").input_ids for gligen_img_phrases_new in gligen_phrases_new]
 
         return examples
 
@@ -792,10 +816,10 @@ def main(args):
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+        controlnet = ControlNetGroundedModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet)
+        controlnet = ControlNetGroundedModel.from_unet(unet)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -819,7 +843,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = ControlNetGroundedModel.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
